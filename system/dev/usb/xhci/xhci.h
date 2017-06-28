@@ -45,6 +45,7 @@ typedef enum {
     EP_STATE_DISABLED = 0,
     EP_STATE_RUNNING,
     EP_STATE_HALTED,        // halted due to stall or error condition
+    EP_STATE_PAUSED,        // temporarily stopped for canceling a transfer
     EP_STATE_DISABLING,     // endpoint is being disabled
     EP_STATE_CLOSING,       // endpoint is shutting down due to device shutdown
 } xhci_ep_state_t;

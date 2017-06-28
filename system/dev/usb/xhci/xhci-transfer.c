@@ -12,7 +12,7 @@
 #include "xhci-transfer.h"
 #include "xhci-util.h"
 
-//#define TRACE 1
+#define TRACE 1
 #include "xhci-debug.h"
 
 //#define TRACE_TRBS 1
@@ -34,10 +34,33 @@ static void print_trb(xhci_t* xhci, xhci_transfer_ring_t* ring, xhci_trb_t* trb)
 static void xhci_process_transactions_locked(xhci_t* xhci, xhci_endpoint_t* ep,
                                              list_node_t* completed_txns);
 
-mx_status_t xhci_reset_endpoint(xhci_t* xhci, uint32_t slot_id, uint32_t endpoint) {
+static mx_status_t xhci_reset_dequeue_ptr_locked(xhci_t* xhci, uint32_t slot_id,
+                                                 uint32_t endpoint) {
     xhci_slot_t* slot = &xhci->slots[slot_id];
     xhci_endpoint_t* ep = &slot->eps[endpoint];
     xhci_transfer_ring_t* transfer_ring = &ep->transfer_ring;
+
+    xhci_sync_command_t command;
+    xhci_sync_command_init(&command);
+    uint64_t ptr = xhci_transfer_ring_current_phys(transfer_ring);
+    ptr |= transfer_ring->pcs;
+    // command expects device context index, so increment endpoint by 1
+    uint32_t control = (slot_id << TRB_SLOT_ID_START) |
+                        ((endpoint + 1) << TRB_ENDPOINT_ID_START);
+    xhci_post_command(xhci, TRB_CMD_SET_TR_DEQUEUE, ptr, control, &command.context);
+    int cc = xhci_sync_command_wait(&command);
+    if (cc != TRB_CC_SUCCESS) {
+        printf("TRB_CMD_SET_TR_DEQUEUE failed cc: %d\n", cc);
+        return MX_ERR_INTERNAL;
+    }
+    transfer_ring->dequeue_ptr = transfer_ring->current;
+
+    return MX_OK;
+}
+
+mx_status_t xhci_reset_endpoint(xhci_t* xhci, uint32_t slot_id, uint32_t endpoint) {
+    xhci_slot_t* slot = &xhci->slots[slot_id];
+    xhci_endpoint_t* ep = &slot->eps[endpoint];
 
     // Recover from Halted and Error conditions. See section 4.8.3 of the XHCI spec.
 
@@ -76,21 +99,11 @@ mx_status_t xhci_reset_endpoint(xhci_t* xhci, uint32_t slot_id, uint32_t endpoin
     // after TRB_CMD_RESET_ENDPOINT.
     if (ep_ctx_state == EP_CTX_STATE_ERROR || ep_ctx_state == EP_CTX_STATE_HALTED) {
         // move transfer ring's dequeue pointer passed the failed transaction
-        xhci_sync_command_t command;
-        xhci_sync_command_init(&command);
-        uint64_t ptr = xhci_transfer_ring_current_phys(transfer_ring);
-        ptr |= transfer_ring->pcs;
-        // command expects device context index, so increment endpoint by 1
-        uint32_t control = (slot_id << TRB_SLOT_ID_START) |
-                            ((endpoint + 1) << TRB_ENDPOINT_ID_START);
-        xhci_post_command(xhci, TRB_CMD_SET_TR_DEQUEUE, ptr, control, &command.context);
-        int cc = xhci_sync_command_wait(&command);
-        if (cc != TRB_CC_SUCCESS) {
-            printf("TRB_CMD_SET_TR_DEQUEUE failed cc: %d\n", cc);
+        mx_status_t status = xhci_reset_dequeue_ptr_locked(xhci, slot_id, endpoint);
+        if (status != MX_OK) {
             mtx_unlock(&ep->lock);
-            return MX_ERR_INTERNAL;
+            return status;
         }
-        transfer_ring->dequeue_ptr = transfer_ring->current;
     }
 
     ep_ctx_state = xhci_get_ep_ctx_state(ep);
@@ -455,6 +468,85 @@ mx_status_t xhci_queue_transfer(xhci_t* xhci, iotxn_t* txn) {
     return MX_OK;
 }
 
+mx_status_t xhci_cancel_transfer(xhci_t* xhci, iotxn_t* txn) {
+    usb_protocol_data_t* proto_data = iotxn_pdata(txn, usb_protocol_data_t);
+    uint32_t slot_id = proto_data->device_id;
+    uint8_t ep_index = xhci_endpoint_index(proto_data->ep_address);
+    mx_status_t status = MX_OK;
+    iotxn_t* test;
+    iotxn_t* temp;
+
+    xprintf("xhci_cancel_transfer slot_id: %d ep_index: %d txn: %p\n", slot_id, ep_index, txn);
+
+    xhci_slot_t* slot = &xhci->slots[slot_id];
+    xhci_endpoint_t* ep =  &slot->eps[ep_index];
+    list_node_t completed_txns = LIST_INITIAL_VALUE(completed_txns);
+
+    mtx_lock(&ep->lock);
+
+    // easy case first. if the txn is still in the queued_txn list, we can simply remove it.
+    list_for_every_entry_safe(&ep->queued_txns, test, temp, iotxn_t, node) {
+        if (test == txn) {
+            list_delete(&txn->node);
+            txn->status = MX_ERR_CANCELED;
+            txn->actual = 0;
+            list_add_head(&completed_txns, &txn->node);
+            goto done;
+        }
+    }
+
+    // harder case - remove a transaction that is already in the transfer ring
+    list_for_every_entry_safe(&ep->pending_txns, test, temp, iotxn_t, node) {
+        if (test == txn) {
+            ep->state = EP_STATE_PAUSED;
+
+            // this will actually result in all pending transactions being canceled
+            xhci_sync_command_t command;
+            xhci_sync_command_init(&command);
+            // command expects device context index, so increment ep_index by 1
+            uint32_t control = (slot_id << TRB_SLOT_ID_START) | ((ep_index + 1) << TRB_ENDPOINT_ID_START);
+            xhci_post_command(xhci, TRB_CMD_STOP_ENDPOINT, 0, control, &command.context);
+
+            // Can't block on command completion while holding the lock
+            mtx_unlock(&ep->lock);
+            int cc = xhci_sync_command_wait(&command);
+            if (cc != TRB_CC_SUCCESS) {
+                // TRB_CC_CONTEXT_STATE_ERROR is normal here in the case of a disconnected device,
+                // since by then the endpoint would already be in error state.
+                printf("TRB_CMD_STOP_ENDPOINT failed cc: %d\n", cc);
+                return MX_ERR_INTERNAL;
+            }
+
+            // Stopping the endpoint should have completed all pending transactions
+            // before TRB_CMD_STOP_ENDPOINT completes
+            MX_DEBUG_ASSERT(list_is_empty(&ep->pending_txns) && ep->current_txn == NULL);
+
+            mtx_lock(&ep->lock);
+            status = xhci_reset_dequeue_ptr_locked(xhci, slot_id, ep_index);
+            if (status == MX_OK) {
+                // resume processing transactions
+                ep->state = EP_STATE_RUNNING;
+                xhci_process_transactions_locked(xhci, ep, &completed_txns);
+            }
+
+            goto done;
+        }
+    }
+
+    // txn not found - maybe it already completed by the time we got here?
+    status = MX_ERR_NOT_FOUND;
+
+done:
+    mtx_unlock(&ep->lock);
+
+    // call complete callbacks out of the lock
+    while ((txn = list_remove_head_type(&completed_txns, iotxn_t, node)) != NULL) {
+        iotxn_complete(txn, txn->status, txn->actual);
+    }
+
+    return status;
+}
+
 static void xhci_control_complete(iotxn_t* txn, void* cookie) {
     completion_signal((completion_t*)cookie);
 }
@@ -496,9 +588,19 @@ int xhci_control_request(xhci_t* xhci, uint32_t slot_id, uint8_t request_type, u
     txn->complete_cb = xhci_control_complete;
     txn->cookie = &completion;
     iotxn_queue(xhci->mxdev, txn);
-    completion_wait(&completion, MX_TIME_INFINITE);
-
-    status = txn->status;
+    status = completion_wait(&completion, MX_SEC(1));
+    if (status == MX_OK) {
+        status = txn->status;
+    } else if (status == MX_ERR_TIMED_OUT) {
+printf("xhci_control_request MX_ERR_TIMED_OUT\n");
+        completion_reset(&completion);
+        status = xhci_cancel_transfer(xhci, txn);
+        if (status == MX_OK) {
+            completion_wait(&completion, MX_TIME_INFINITE);
+            status = MX_ERR_TIMED_OUT;
+        }
+    }
+printf("xhci_cancel_transfer got %d\n", status);
     if (status == MX_OK) {
         status = txn->actual;
 
@@ -572,6 +674,9 @@ void xhci_handle_transfer_event(xhci_t* xhci, xhci_trb_t* trb) {
         case TRB_CC_STOPPED_LENGTH_INVALID:
         case TRB_CC_STOPPED_SHORT_PACKET:
             switch (ep->state) {
+            case EP_STATE_PAUSED:
+                result = MX_ERR_CANCELED;
+                break;
             case EP_STATE_DISABLING:
                 result = MX_ERR_BAD_STATE;
                 break;

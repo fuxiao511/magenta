@@ -164,7 +164,7 @@ static mx_status_t xhci_address_device(xhci_t* xhci, uint32_t slot_id, uint32_t 
         if (status == MX_ERR_IO_REFUSED) {
             printf("xhci_handle_enumerate_device xhci_reset_endpoint\n");
             xhci_reset_endpoint(xhci, slot_id, 0);
-        } else {
+        } else if (status != MX_ERR_TIMED_OUT) {
             break;
         }
     }
@@ -306,7 +306,6 @@ disable_slot_exit:
     return result;
 }
 
-// returns true if endpoint was enabled
 static mx_status_t xhci_stop_endpoint(xhci_t* xhci, uint32_t slot_id, int ep_index,
                                       xhci_ep_state_t new_state) {
     xhci_slot_t* slot = &xhci->slots[slot_id];
